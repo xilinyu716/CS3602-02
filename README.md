@@ -1,4 +1,4 @@
-# FlashAttention-Optimization 项目指南
+# Efficient Inference 项目指南
 
 **概览**
 - 提供基于H2O的attention优化、基于int8 weight-only量化的MLP优化，支持 BF16/FP16 activation、CUDA Graph。
