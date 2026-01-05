@@ -15,9 +15,7 @@ class KVCacheManager:
         self.window_size = window_size
         self.h2o_heavy_size = h2o_heavy_size
 
-        self.past = None              # legacy kv
-        # H2O specific: Store accumulated attention scores for each layer
-        # List of tensors, one per layer: (batch, num_heads, seq_len)
+        self.past = None
         self.importance = None 
         
     def reset(self):
@@ -32,13 +30,11 @@ class KVCacheManager:
             self.importance = None
             return None
 
-        # ---- unwrap DynamicCache once
         if isinstance(past_key_values, DynamicCache):
             kv = past_key_values.to_legacy_cache()
         else:
             kv = past_key_values
             
-        # Ensure self.past is set correctly for first run
         self.past = kv
 
         seq_len = kv[0][0].shape[2]
@@ -66,9 +62,7 @@ class KVCacheManager:
             self.past_key_values = DynamicCache.from_legacy_cache(self.past)
             return self.past_key_values
 
-    # --------------------------------------------------
-    # index selection
-    # --------------------------------------------------
+
     def _streaming_indices(self, seq_len):
         if seq_len <= self.sink_size + self.window_size:
             return torch.arange(seq_len)
@@ -79,36 +73,26 @@ class KVCacheManager:
 
     def _h2o_indices(self, seq_len):
         if seq_len <= self.window_size + self.h2o_heavy_size:
-            # Must return tensor on correct device!
-            # Use self.past to infer device if possible, or just CPU?
-            # gather needs index on same device as k/v.
+
             device = self.past[0][0].device if self.past else "cpu"
             return torch.arange(seq_len, device=device)
 
         device = self.past[0][0].device if self.past else "cpu"
         window = torch.arange(seq_len - self.window_size, seq_len, device=device)
 
-        # aggregate across layers
-        if isinstance(self.importance, list) and len(self.importance) > 0:
-            scores = torch.stack(self.importance).sum(0)
-        else:
-            scores = self.importance
-        # scores should be on GPU if attentions were on GPU.
+        scores = self.importance
+        if scores is None:
+            return torch.arange(seq_len, device=device)
         
         candidates = scores[: seq_len - self.window_size]
 
         k = min(self.h2o_heavy_size, candidates.numel())
         _, heavy = torch.topk(candidates, k)
         
-        # heavy indices will be on same device as scores
-        
         keep = torch.cat([heavy, window])
         keep, _ = torch.sort(keep)
         return keep
 
-    # --------------------------------------------------
-    # pruning
-    # --------------------------------------------------
     def _prune_kv(self, keep_idx):
         new_past = []
         for k, v in self.past:
@@ -124,60 +108,40 @@ class KVCacheManager:
         self.past = tuple(new_past)
 
         if self.importance is not None:
-            self.importance = [
-                score[keep_idx] for score in self.importance
-            ]
+            self.importance = self.importance[keep_idx]
 
-    # --------------------------------------------------
-    # H2O score update
-    # --------------------------------------------------
     def _update_h2o_scores(self, attentions):
-        # attentions: tuple[layer] -> (B, H, q_len, k_len)
-        if self.importance is None:
-            self.importance = []
 
-        for i, attn in enumerate(attentions):
-            # attn: (B, H, q_len, k_len)
-            # We want to sum over Batch, Heads, Query Length to get importance per Key token
-            # This is heavy if done naively in Python loop
-            # But here `attentions` is a tuple of tensors.
-            
-            # Optimization: 
-            # `attn` is usually on GPU. `sum` is fast.
-            # But we iterate over 32 layers in Python.
-            # And we do `score.clone()`, `torch.cat`, `old + score`.
-            # This is 32 * N kernel launches per step.
-            # For small batch decoding, launch overhead is significant.
-            
+        new_scores = None
+        for attn in attentions:
             attn_t = attn[0] if isinstance(attn, tuple) else attn
+            score = attn_t.sum(dim=(0, 1, 2))
             
-            # Sum over B, H, Q
-            # score shape: (k_len)
-            score = attn_t.sum(dim=(0, 1, 2)) 
-
-            if i >= len(self.importance):
-                self.importance.append(score)
+            if new_scores is None:
+                new_scores = score
             else:
-                old = self.importance[i]
-                # If seq_len increased (decoding), pad old scores
-                # Usually k_len = old_len + 1
-                diff = score.shape[0] - old.shape[0]
-                if diff > 0:
-                    # Pad old with zeros
-                    pad = torch.zeros(diff, device=old.device, dtype=old.dtype)
-                    old = torch.cat([old, pad])
-                elif diff < 0:
-                    # Should not happen in standard decoding unless we just pruned?
-                    # If we pruned, `importance` was pruned too.
-                    pass
-                
-                # In-place add if possible? 
-                # old + score creates new tensor.
-                self.importance[i] = old + score
+                new_scores = new_scores + score
+        
+        if new_scores is None:
+            return
+        
+        if self.importance is None:
+            self.importance = new_scores
+        else:
+            old_len = self.importance.shape[0]
+            new_len = new_scores.shape[0]
+            
+            if new_len > old_len:
+                diff = new_len - old_len
+                new_scores[:old_len] = new_scores[:old_len] + self.importance
+                self.importance = new_scores
+            elif new_len == old_len:
+                self.importance = self.importance + new_scores
+            else:
+                self.importance = self.importance[:new_len] + new_scores
     
     def get_cache_size(self):
         """Returns the number of tokens currently in the cache."""
         if self.past is None:
             return 0
-        # self.past is tuple of tuples, first layer, first element (key), 3rd dim (seq_len)
         return self.past[0][0].shape[2]

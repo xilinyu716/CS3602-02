@@ -59,7 +59,7 @@ def get_tokenizer(model_path):
         tok.pad_token = tok.eos_token
     return tok
 
-def run_mode(model_path, ckpt_dir, mode, prefill_len, decode_len, window, h2o_hh, batch_size=1):
+def run_mode(model_path, ckpt_dir, mode, prefill_len, decode_len, window, h2o_hh, batch_size=1, data_path=None):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     need_attn = (mode == "int8_h2o")
     attn_impl = ("eager" if need_attn else "sdpa")
@@ -128,7 +128,7 @@ def run_mode(model_path, ckpt_dir, mode, prefill_len, decode_len, window, h2o_hh
     kv = KVCacheManager(mode=kv_mode, window_size=window, h2o_heavy_size=h2o_hh)
     
 
-    ds = load_dataset("/home/xlyu/datasets/wikitext", split="test")
+    ds = load_dataset(data_path, split="test")
     text = "\n\n".join(ds["text"])
         
     enc = tok(text, return_tensors="pt")
@@ -171,9 +171,7 @@ def run_mode(model_path, ckpt_dir, mode, prefill_len, decode_len, window, h2o_hh
     if torch.cuda.is_available():
         torch.cuda.nvtx.range_push(f"RunMode_{mode}")
 
-    # ==========================
     # 1. Prefill Phase
-    # ==========================
     print(f"Running Prefill ({prefill_len} tokens)...")
     inp_prefill = input_ids[:, :prefill_len]
     
@@ -197,9 +195,7 @@ def run_mode(model_path, ckpt_dir, mode, prefill_len, decode_len, window, h2o_hh
         
     kv.update(out.past_key_values, attentions=(out.attentions if need_attn else None))
     
-    # ==========================
     # 2. CUDA Graph Capture (Optional)
-    # ==========================
     if use_cuda_graph:
         print("Enabling CUDA Graph for Int8Linear modules (decode step shapes)...")
         
@@ -219,9 +215,7 @@ def run_mode(model_path, ckpt_dir, mode, prefill_len, decode_len, window, h2o_hh
                 count += 1
             print(f"Graphed {count} Int8Linear modules.")
 
-    # ==========================
     # 3. Decoding Phase
-    # ==========================
     print(f"Running Decoding ({decode_len} steps)...")
     
     with torch.no_grad():
@@ -304,11 +298,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_path", type=str, default="/home/xlyu/models/models--EleutherAI--pythia-2.8b")
     ap.add_argument("--ckpt_dir", type=str, default="../checkpoints/pythia-2.8b-int8")
-    ap.add_argument("--prefill_len", type=int, default=500)
-    ap.add_argument("--decode_len", type=int, default=1000)
+    ap.add_argument("--prefill_len", type=int, default=128)
+    ap.add_argument("--decode_len", type=int, default=2048)
     ap.add_argument("--window", type=int, default=252)
     ap.add_argument("--h2o_hh", type=int, default=252)
     ap.add_argument("--batch_size", type=int, default=1)
+    ap.add_argument("--dataset", type=str, default="/home/xlyu/datasets/wikitext")
     args = ap.parse_args()
     wq, sc, b = load_quantized_checkpoint(args.ckpt_dir)
     model_cpu = AutoModelForCausalLM.from_pretrained(
@@ -322,19 +317,15 @@ def main():
     print(f"Batch Size: {args.batch_size}")
     
     print("Running FP16 baseline full-attention")
-    r_fp16 = run_mode(args.model_path, args.ckpt_dir, "fp16_full", args.prefill_len, args.decode_len, args.window, args.h2o_hh, args.batch_size)
+    r_fp16 = run_mode(args.model_path, args.ckpt_dir, "fp16_full", args.prefill_len, args.decode_len, args.window, args.h2o_hh, args.batch_size, args.dataset)
     print("Running INT8 weight-only full-attention")
-    r_int8_full = run_mode(args.model_path, args.ckpt_dir, "int8_full", args.prefill_len, args.decode_len, args.window, args.h2o_hh, args.batch_size)
+    r_int8_full = run_mode(args.model_path, args.ckpt_dir, "int8_full", args.prefill_len, args.decode_len, args.window, args.h2o_hh, args.batch_size, args.dataset)
     print("Running INT8 weight-only + H2O KV cache")
-    r_int8_h2o = run_mode(args.model_path, args.ckpt_dir, "int8_h2o", args.prefill_len, args.decode_len, args.window, args.h2o_hh, args.batch_size)
+    r_int8_h2o = run_mode(args.model_path, args.ckpt_dir, "int8_h2o", args.prefill_len, args.decode_len, args.window, args.h2o_hh, args.batch_size, args.dataset)
     print("==================================================")
     for r in [r_fp16, r_int8_full, r_int8_h2o]:
         print(f"Mode: {r['mode']}")
         print(f"Total Throughput: {r['total_tps']:.2f} tokens/sec")
-        print(f"Prefill Throughput: {r['prefill_tps']:.2f} tokens/sec")
-        print(f"Prefill Latency: {r['prefill_lat_ms']:.2f} ms")
-        print(f"Decoding Throughput: {r['decode_tps']:.2f} tokens/sec")
-        print(f"Decoding Latency: {r['decode_lat_ms']:.2f} ms/token")
         print(f"Peak GPU Memory: {r['peak_mb']:.2f} MB")
         print(f"PPL: {r['ppl']:.4f}")
         print(f"Total Time: {r['total_s']:.2f} s")
